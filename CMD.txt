@@ -1,0 +1,173 @@
+import os
+import re
+import time
+import requests
+import subprocess
+import streamlit as st
+from pypdf import PdfReader
+import docx2txt
+
+# --- CÁC HÀM LÕI KỸ THUẬT (GIỮ NGUYÊN TỪ CÁC GIAI ĐOẠN TRƯỚC) ---
+
+def read_word_file(uploaded_file):
+    # Lưu tạm file từ bộ nhớ xuống ổ cứng để thư viện đọc được
+    with open("temp_file.docx", "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    text = docx2txt.process("temp_file.docx")
+    os.remove("temp_file.docx") # Đọc xong thì xóa file tạm
+    return text
+
+def read_pdf_file(uploaded_file):
+    reader = PdfReader(uploaded_file)
+    full_text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            full_text += page_text + "\n"
+    return full_text
+
+def smart_text_chunking(text, max_chars=2000):
+    text = re.sub(r'\n+', '\n', text).strip()
+    chunks = []
+    current_chunk = ""
+    sentences = re.split(r'(?<=[.!?\n])\s+', text)
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+                
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+def text_to_speech_fpt(text, api_key, voice_code, output_filename):
+    url = "https://api.fpt.ai/hcm/v5/vtts"
+    headers = {
+        "api-key": api_key,
+        "speed": "1",
+        "voice": voice_code
+    }
+    response = requests.post(url, data=text.encode('utf-8'), headers=headers)
+    if response.status_code == 200:
+        audio_url = response.json().get("async")
+        time.sleep(8) # Chờ FPT xử lý ngầm
+        audio_response = requests.get(audio_url)
+        if audio_response.status_code == 200:
+            with open(output_filename, "wb") as f:
+                f.write(audio_response.content)
+            return True
+    return False
+
+def merge_mp3_files(file_list, output_filename):
+    list_filename = "danh_sách_noi_file.txt"
+    with open(list_filename, "w", encoding="utf-8") as f:
+        for file_path in file_list:
+            f.write(f"file '{file_path}'\n")
+            
+    cmd = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", list_filename, "-c", "copy", "-y", output_filename]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for file_path in file_list:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        if os.path.exists(list_filename):
+            os.remove(list_filename)
+        return True
+    except Exception:
+        return False
+
+# =================================================================
+# THIẾT KẾ GIAO DIỆN WEB (STREAMLIT UI)
+# =================================================================
+
+# 1. Tiêu đề ứng dụng
+st.set_page_index = "🎬"
+st.title("🎙️ Ứng dụng Chuyển Tài Liệu Thành Podcast")
+st.write("Biến các file tài liệu khô khan thành file âm thanh Podcast chất lượng cao.")
+
+# 2. Thanh bên trái (Sidebar) - Nơi cấu hình kỹ thuật
+st.sidebar.header("⚙️ Cấu hình Hệ thống")
+api_key = st.sidebar.text_input("Nhập FPT.AI API Key của bạn:", type="password")
+
+# Lựa chọn giọng đọc trực quan
+giong_doc_dict = {
+    "Nữ miền Bắc (Ban Mai)": "banmai",
+    "Nam miền Bắc (Lê Minh)": "leminh",
+    "Nữ miền Nam (Lan Anh)": "lananh",
+    "Nam miền Nam (Minh Quang)": "minhquang"
+}
+giong_doc_lua_chon = st.sidebar.selectbox("Chọn giọng đọc chuẩn tiếng Việt:", list(giong_doc_dict.keys()))
+voice_code = giong_doc_dict[giong_doc_lua_chon]
+
+# 3. Vùng làm việc chính - Nút tải file
+uploaded_file = st.file_uploader("Tải file tài liệu lên (Hỗ trợ PDF hoặc Word):", type=["pdf", "docx"])
+
+if uploaded_file is not None:
+    st.success(f" Đã nhận file: {uploaded_file.name}")
+    
+    # Bấm nút để kích hoạt quá trình chạy
+    if st.button("🚀 Bắt đầu tạo tập Podcast"):
+        if not api_key:
+            st.error("Vui lòng nhập API Key ở thanh bên trái trước khi bắt đầu!")
+        else:
+            # Tiến hành đọc file
+            with st.spinner("Đang bóc tách văn bản từ tài liệu..."):
+                if uploaded_file.name.endswith(".docx"):
+                    van_ban_goc = read_word_file(uploaded_file)
+                else:
+                    van_ban_goc = read_pdf_file(uploaded_file)
+            
+            # Cắt nhỏ văn bản
+            cac_manh_chu = smart_text_chunking(van_ban_goc, max_chars=2000)
+            st.info(f"Tài liệu dài được chia thành {len(cac_manh_chu)} phần để xử lý.")
+            
+            # Khởi tạo thanh tiến trình trực quan trên giao diện
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            danh_sach_file_mp3 = []
+            loi_xay_ra = False
+            
+            # Vòng lặp xử lý cuốn chiếu
+            for index, doan_van in enumerate(cac_manh_chu):
+                ten_file_tam = f"manh_web_{index + 1}.mp3"
+                status_text.text(f"⏳ Đang chuyển đổi giọng nói phần {index + 1}/{len(cac_manh_chu)}...")
+                
+                thanh_cong = text_to_speech_fpt(doan_van, api_key, voice_code, ten_file_tam)
+                if thanh_cong:
+                    danh_sach_file_mp3.append(ten_file_tam)
+                else:
+                    st.error(f"Lỗi xảy ra ở phần {index + 1}. Hãy kiểm tra lại Key API.")
+                    loi_xay_ra = True
+                    break
+                
+                # Cập nhật thanh tiến trình tăng dần
+                progress_bar.progress((index + 1) / len(cac_manh_chu))
+            
+            # Tiến hành nối file bằng FFmpeg nếu không có lỗi
+            if not loi_xay_ra and danh_sach_file_mp3:
+                status_text.text("🎛️ Đang ghép nối các phần âm thanh bằng FFmpeg...")
+                file_podcast_cuoi = "Podcast_Thành_Phẩm.mp3"
+                
+                if merge_mp3_files(danh_sach_file_mp3, file_podcast_cuoi):
+                    status_text.text("🎉 Hoàn thành!")
+                    st.balloons() # Hiệu ứng bóng bay chúc mừng trên màn hình Web
+                    st.success("Tập Podcast của bạn đã sẵn sàng!")
+                    
+                    # Hiện nút bấm TẢI FILE MP3 TRỰC TIẾP TRÊN TRÌNH DUYỆT
+                    with open(file_podcast_cuoi, "rb") as file:
+                        st.download_button(
+                            label="📥 TẢI FILE MP3 PODCAST VỀ MÁY",
+                            data=file,
+                            file_name=f"Podcast_{uploaded_file.name.split('.')[0]}.mp3",
+                            mime="audio/mp3"
+                        )
+                else:
+                    st.error("Không thể kết hợp file. Kiểm tra lại việc cài đặt FFmpeg trên máy tính.")
